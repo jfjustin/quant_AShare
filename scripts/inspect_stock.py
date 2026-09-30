@@ -33,6 +33,7 @@ from quant.universe import SEED, SECTOR_MAP
 from quant.signals import build_alpha
 from quant.sentiment.sentiment_engine import compute_sentiment
 from quant.sentiment.lexicon import score_text
+from quant.us_market import cross_market_read, A2US_PEERS
 
 _H = {"User-Agent": "Mozilla/5.0", "Referer": "https://so.eastmoney.com/"}
 
@@ -95,18 +96,33 @@ def main() -> None:
     peers = sorted(set(SEED.get(theme, [])) | {code})
 
     cfg = Config.load()
-    md = MarketData(choice=ChoiceClient())   # offline; free endpoints only
+    client = ChoiceClient(start_options=cfg.get("choice.start_options", "ForceLogin=1"))
+    client.login()
+    md = MarketData(choice=client)
 
-    # names + live quote
+    # names + live quote (free push2)
     rt = md.realtime(peers)
     name = rt.at[code, "name"] if (not rt.empty and code in rt.index) else code
     last = rt.at[code, "last"] if (not rt.empty and code in rt.index) else float("nan")
     pctchg = rt.at[code, "pctchg"] if (not rt.empty and code in rt.index) else float("nan")
 
-    # free daily history for the whole peer set
-    hist = md.klines(peers, bars=args.bars)
+    # history: prefer Choice (reliable, entitled); fall back to free providers
+    hist = pd.DataFrame()
+    if client.is_live:
+        from datetime import timedelta
+        end = datetime.now().strftime("%Y-%m-%d")
+        start = (datetime.now() - timedelta(days=int(args.bars * 1.7))).strftime("%Y-%m-%d")
+        try:
+            hist = md.history(peers, start, end)
+            if not hist.empty:
+                print(f"(history via Choice: {len(hist.index.get_level_values(0).unique())} names)")
+        except Exception as e:
+            print(f"(Choice history failed: {e}; trying free providers)")
     if hist.empty or code not in hist.index.get_level_values(0):
-        print(f"No history for {code}."); return
+        hist = md.klines(peers, bars=args.bars)
+    if hist.empty or code not in hist.index.get_level_values(0):
+        print(f"No history for {code} from Choice or free providers "
+              f"(free endpoints may be rate-limited; Choice live={client.is_live})."); return
     perf = _perf(hist.xs(code, level=0))
 
     # sentiment for the peer set (so this name's delta/attention is comparable)
@@ -160,6 +176,32 @@ def main() -> None:
         tag = "▲" if pol > 0.05 else ("▼" if pol < -0.05 else "·")
         print(f"    {tag} [{pol:+.2f}] {dt}  {title[:46]}")
 
+    # ---- US cross-market lead-lag ----
+    us_catchup = 0.0
+    a_close = hist.xs(code, level=0)["close"] if code in hist.index.get_level_values(0) else pd.Series(dtype=float)
+    cm = cross_market_read(code, a_close)
+    if cm and "metrics" in cm and cm["metrics"]:
+        m = cm["metrics"]; peer = cm["peer"]
+        print("\n  US CROSS-MARKET  (business peer lead-lag)")
+        print(f"    peer: {'/'.join(peer['us'])}  (link {peer['link']:.2f})")
+        print(f"    {peer['why']}")
+        print(f"    lead {cm['lead_ticker']} @ {cm['lead_close']:.2f}  "
+              f"US 1d {m.get('us_ret_1d', float('nan')):+.1%}  5d {m.get('us_ret_5d', float('nan')):+.1%}")
+        print(f"    return corr {m.get('corr', float('nan')):+.2f}  "
+              f"(US-leads-1d {m.get('corr_lag1')})")
+        cu5 = m.get("catchup_5d", float("nan"))
+        print(f"    catch-up gap 5d: {cu5:+.1%}   "
+              f"(A-share {m.get('a_ret_5d', float('nan')):+.1%} vs US {m.get('us_ret_5d', float('nan')):+.1%})")
+        # signal: gap * business-linkage * correlation sign. Positive => A should rise.
+        if cu5 == cu5:
+            us_catchup = float(np.tanh(cu5 * 6) * peer["link"] * max(0.0, m.get("corr", 0)))
+            tell = ("A-share LAGS a US peer rally -> catch-up LONG" if us_catchup > 0.08 else
+                    "A-share LAGS a US peer selloff -> catch-up SHORT" if us_catchup < -0.08 else
+                    "roughly in sync / weak signal")
+            print(f"    => cross-market tilt {us_catchup:+.2f}  ({tell})")
+    elif code in A2US_PEERS:
+        print("\n  US CROSS-MARKET: peer mapped but US data unavailable this run.")
+
     print("\n  BOOK VERDICT")
     alpha = float(z.at[code, "alpha"]) if code in z.index else 0.0
     lean = "LONG" if alpha > 0.15 else ("SHORT" if alpha < -0.15 else "NEUTRAL")
@@ -169,8 +211,11 @@ def main() -> None:
     # ---- FINAL VERDICT: buy-signal % and probability of profit ----
     def _sig(x):  # logistic
         return 1.0 / (1.0 + np.exp(-x))
-    # Buy signal 0-100 (50 = neutral). Blend alpha magnitude and peer percentile.
-    buy_signal = 100 * (0.7 * _sig(1.0 * alpha) + 0.3 * pct)
+    # Buy signal 0-100 (50 = neutral). Blend alpha, peer percentile, and the
+    # US cross-market catch-up tilt (business-peer lead-lag).
+    combined = alpha + 0.8 * us_catchup
+    buy_signal = 100 * (0.62 * _sig(1.0 * combined) + 0.24 * pct + 0.14 * _sig(4 * us_catchup))
+    alpha = combined  # feed the cross-market-adjusted score into P(profit) below
     # P(profit) at the ~5d reversal horizon. Base rate 50%, tilted by signal.
     # Tilt deliberately capped at ±16% — these edges are real but SMALL; a
     # single-name call is noisy. Conviction scales the honest edge.

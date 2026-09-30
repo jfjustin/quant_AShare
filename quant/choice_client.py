@@ -70,26 +70,38 @@ class ChoiceClient:
             return False
 
         self._c = c
-        opts = self.start_options
+
+        def _attempt(opts: str, label: str) -> bool:
+            try:
+                data = c.start(opts, "", None)
+            except Exception as e:  # pragma: no cover
+                log.warning("Choice start() [%s] raised %s.", label, e)
+                return False
+            code = str(getattr(data, "ErrorCode", "0"))
+            if code in ("0", "10000000"):  # success sentinel
+                log.info("Choice login OK via %s.", label)
+                return True
+            log.info("Choice login via %s failed [%s] %s.",
+                     label, code, getattr(data, "ErrorMsg", ""))
+            return False
+
+        # 1) Prefer the activation-TOKEN login (no creds). This is what the
+        #    LoginActivator provisions and what most Choice accounts support.
+        if _attempt(self.start_options, "activation-token"):
+            self.is_live = True
+            return True
+
+        # 2) Fall back to username/password login if credentials are supplied.
         if self.username and self.password:
-            opts = f"UserName={self.username},PassWord={self.password},{opts}"
-        try:
-            data = c.start(opts, "", None)
-        except Exception as e:  # pragma: no cover
-            log.warning("Choice start() raised %s. OFFLINE mode.", e)
-            self.is_live = False
-            return False
+            opts = f"UserName={self.username},PassWord={self.password},{self.start_options}"
+            if _attempt(opts, "username/password"):
+                self.is_live = True
+                return True
 
-        code = str(getattr(data, "ErrorCode", "0"))
-        if code not in ("0", "10000000"):  # 0 / success sentinel
-            log.warning("Choice login failed [%s] %s. OFFLINE mode.",
-                        code, getattr(data, "ErrorMsg", ""))
-            self.is_live = False
-            return False
-
-        self.is_live = True
-        log.info("Choice login OK.")
-        return True
+        log.warning("Choice login failed on all methods. OFFLINE mode "
+                    "(run scripts/activate_choice.sh to (re)activate).")
+        self.is_live = False
+        return False
 
     def close(self) -> None:
         if self._c is not None and self.is_live:
@@ -126,9 +138,33 @@ class ChoiceClient:
         """
         c = self._require()
         opts = self._opts("Ispandas=1", kw)
-        data = c.css(_join(codes), _join(fields), opts)
-        df = self._as_frame(data, fields)
-        return df
+        field_list = _to_list(fields)
+        try:
+            return self._as_frame(c.css(_join(codes), _join(fields), opts), fields)
+        except ChoiceError as e:
+            if len(field_list) <= 1:
+                raise
+            # A single unentitled/invalid field errors the whole batch. Retry
+            # field-by-field and keep the columns that succeed.
+            log.info("css batch failed (%s); retrying field-by-field", e.msg)
+            kept = {}
+            for f in field_list:
+                try:
+                    part = self._as_frame(c.css(_join(codes), f, opts), [f])
+                    # css returns a 'DATES' column too — pick the value column.
+                    valcols = [c2 for c2 in part.columns
+                               if str(c2).upper() != "DATES"]
+                    if valcols and not part.empty:
+                        kept[f] = part[valcols[0]]
+                except ChoiceError:
+                    log.info("  dropping unavailable field: %s", f)
+            if not kept:
+                raise
+            out = pd.DataFrame(kept)
+            # single-field css can return object dtype; coerce where numeric
+            for col in out.columns:
+                out[col] = pd.to_numeric(out[col], errors="ignore")
+            return out
 
     def csd(self, codes, fields, start, end, **kw) -> pd.DataFrame:
         """Time-series: MultiIndex (code, date) rows, one column per field."""
@@ -159,7 +195,7 @@ class ChoiceClient:
     def _as_frame(data, fields) -> pd.DataFrame:
         """Coerce an EmQuantData / DataFrame result into a tidy DataFrame."""
         if isinstance(data, pd.DataFrame):
-            return data
+            return ChoiceClient._coerce_numeric(data)
         code = str(getattr(data, "ErrorCode", "0"))
         if code not in ("0", "10000000"):
             raise ChoiceError(code, getattr(data, "ErrorMsg", ""))
@@ -169,4 +205,16 @@ class ChoiceClient:
         for cd in getattr(data, "Codes", []) or []:
             vals = data.Data.get(cd, [])
             rows[cd] = vals[: len(cols)]
-        return pd.DataFrame.from_dict(rows, orient="index", columns=cols)
+        return ChoiceClient._coerce_numeric(
+            pd.DataFrame.from_dict(rows, orient="index", columns=cols))
+
+    @staticmethod
+    def _coerce_numeric(df: pd.DataFrame) -> pd.DataFrame:
+        """Choice with Ispandas=1 often returns object dtype; make numerics
+        numeric (leaving genuine text columns like names untouched)."""
+        if df is None or df.empty:
+            return df
+        for col in df.columns:
+            if df[col].dtype == object:
+                df[col] = pd.to_numeric(df[col], errors="ignore")
+        return df

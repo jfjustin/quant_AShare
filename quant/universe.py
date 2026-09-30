@@ -39,6 +39,9 @@ SEED = {
     "battery_chain":        ["300750.SZ", "300014.SZ", "002812.SZ", "688005.SH"],
     "photovoltaic":         ["601012.SH", "300274.SZ", "688599.SH"],
     "consumer_electronics": ["002475.SZ", "002241.SZ", "300136.SZ"],
+    # US-coupled AI/semiconductor supply-chain names (see quant/us_market.py).
+    "us_ai_supplychain": ["300476.SZ", "300308.SZ", "688256.SH", "688041.SH",
+                          "688981.SH", "002371.SZ", "688012.SH", "300474.SZ"],
 }
 
 
@@ -84,6 +87,11 @@ def apply_quality_filters(cfg: Config, md: MarketData, cand: pd.DataFrame,
 
     snap = md.snapshot(list(cand.index), tradedate)
     df = cand.join(snap, how="left")
+    # css field-by-field fallback can return object/str columns — coerce numerics
+    for col in ("mktcap", "amount", "pe_ttm", "turnover", "close",
+                "north_value", "eps_growth_est"):
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
     f = cfg.get("universe.filters", {})
 
     def _keep(row) -> bool:

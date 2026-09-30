@@ -1,0 +1,13 @@
+config.yaml
+data/*.json
+logs/*.log
+__pycache__/
+*.pyc
+.env
+
+# data caches & artifacts
+data/*.pkl
+data/panel_*.pkl
+*.pkl
+.DS_Store
+**/.DS_Store

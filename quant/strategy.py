@@ -54,6 +54,19 @@ def run_strategy(cfg: Config, tradedate: str | None = None,
     client.login()
     md = MarketData(choice=client)
 
+    # 0) resolve to the latest actual trading day (today may be a weekend/holiday)
+    if client.is_live:
+        try:
+            gd = client._require().getdate(tradedate, 0, "Market=CNSESH")
+            latest = (getattr(gd, "Data", None) or [None])[0]
+            if latest:
+                # normalize "2026/7/24" (or similar) -> zero-padded "2026-07-24"
+                from dateutil import parser as _dp
+                tradedate = _dp.parse(str(latest).replace("/", "-")).strftime("%Y-%m-%d")
+                log.info("resolved trade date -> %s", tradedate)
+        except Exception as e:
+            log.warning("getdate failed (%s); using %s", e, tradedate)
+
     # 1) universe
     uni = build_universe(cfg, md, tradedate.replace("-", ""))
     codes = list(uni.index)

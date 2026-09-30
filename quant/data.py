@@ -30,12 +30,15 @@ DAILY_FIELDS = {
     "OPEN": "open", "CLOSE": "close", "HIGH": "high", "LOW": "low",
     "VOLUME": "volume", "AMOUNT": "amount", "TURN": "turnover",
 }
+# Core fields verified to return real data on a standard Choice account.
 SNAPSHOT_FIELDS = {
-    "CLOSE": "close", "PETTM": "pe_ttm", "PBLYRN": "pb", "MV": "mktcap",
-    "TOTALSHARE": "total_share", "TURN": "turnover", "AMOUNT": "amount",
-    # northbound holding value & 1d change, analyst consensus EPS revision:
-    "HKHOLDVALUE": "north_value", "WRATING": "analyst_rating",
-    "ESTNETPROFITYOY": "eps_growth_est",
+    "CLOSE": "close", "PETTM": "pe_ttm", "MV": "mktcap",
+    "TURN": "turnover", "AMOUNT": "amount",
+}
+# Optional fields — attempted best-effort; silently dropped if the account is
+# not entitled (northbound holdings / analyst estimates are premium tiers).
+OPTIONAL_SNAPSHOT_FIELDS = {
+    "HKHOLDVALUE": "north_value", "ESTNETPROFITYOY": "eps_growth_est",
 }
 
 _HTTP = requests.Session()
@@ -55,16 +58,51 @@ class MarketData:
 
     # -- history (Choice) ----------------------------------------------------
     def history(self, codes, start: str, end: str) -> pd.DataFrame:
-        """Adjusted daily OHLCV as MultiIndex(code, date). Choice-only."""
-        fields = ",".join(DAILY_FIELDS)
-        df = self.choice.csd(codes, fields, start, end)
-        return self._rename(df, DAILY_FIELDS)
+        """Adjusted daily OHLCV as MultiIndex(code, date). Choice-only.
+
+        csd returns a flat CODES-indexed frame with a DATES column; we rebuild a
+        proper (code, date) MultiIndex so factors and per-name slicing work.
+        """
+        df = self.choice.csd(codes, ",".join(DAILY_FIELDS), start, end)
+        if df is None or df.empty:
+            return pd.DataFrame()
+        df = df.reset_index()
+
+        def _col(c: str) -> str:
+            u = str(c).upper()
+            if u in ("CODES", "CODE"):
+                return "code"
+            if u in ("DATES", "DATE"):
+                return "date"
+            return DAILY_FIELDS.get(u, str(c).lower())
+
+        df = df.rename(columns={c: _col(c) for c in df.columns})
+        if "code" not in df.columns or "date" not in df.columns:
+            return pd.DataFrame()
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+        return df.dropna(subset=["date"]).set_index(["code", "date"]).sort_index()
 
     def snapshot(self, codes, tradedate: str) -> pd.DataFrame:
-        """Cross-section of fundamentals+price on one date. Choice-only."""
-        fields = ",".join(SNAPSHOT_FIELDS)
-        df = self.choice.css(codes, fields, TradeDate=tradedate)
-        return self._rename(df, SNAPSHOT_FIELDS)
+        """Cross-section of fundamentals+price on one date. Choice-only.
+
+        Requests core + optional fields; the client drops any field the account
+        is not entitled to, so this never crashes on a premium-tier indicator.
+        """
+        # Core fields in one clean batch (all entitled -> no fallback needed).
+        core = self._rename(
+            self.choice.css(codes, ",".join(SNAPSHOT_FIELDS), TradeDate=tradedate),
+            SNAPSHOT_FIELDS)
+        # Optional premium fields best-effort; skip silently if unentitled.
+        try:
+            opt = self._rename(
+                self.choice.css(codes, ",".join(OPTIONAL_SNAPSHOT_FIELDS),
+                                TradeDate=tradedate),
+                OPTIONAL_SNAPSHOT_FIELDS)
+            core = core.join(opt.drop(columns=[c for c in opt.columns
+                             if c in core.columns], errors="ignore"), how="left")
+        except Exception as e:
+            log.info("optional snapshot fields unavailable: %s", e)
+        return core
 
     # -- realtime (push2, free) ---------------------------------------------
     def realtime(self, codes) -> pd.DataFrame:
@@ -104,9 +142,11 @@ class MarketData:
             codes = [c.strip() for c in codes.split(",") if c.strip()]
         frames = []
         for c in codes:
-            rows = self._kline_eastmoney(_secid(c), bars)
-            if not rows:                       # fall back to an independent vendor
-                rows = self._kline_tencent(c, bars)
+            # Tencent first: reliable and fast. East Money history host is
+            # chronically IP-throttled, so use it only as a fallback.
+            rows = self._kline_tencent(c, bars)
+            if not rows:
+                rows = self._kline_eastmoney(_secid(c), bars)
             if not rows:
                 log.warning("kline %s unavailable from all providers", c)
                 continue
@@ -165,5 +205,7 @@ class MarketData:
     def _rename(df: pd.DataFrame, mapping: dict) -> pd.DataFrame:
         if df is None or df.empty:
             return pd.DataFrame()
+        df = df.drop(columns=[c for c in df.columns if str(c).upper() == "DATES"],
+                     errors="ignore")
         low = {c: mapping.get(str(c).upper(), str(c).lower()) for c in df.columns}
         return df.rename(columns=low)
