@@ -129,53 +129,51 @@ def _weights(pred_row: pd.Series, quantile: float) -> pd.Series:
 
 
 def backtest_long_short(pred: pd.Series, panel: pd.DataFrame, quantile=0.2,
-                        horizon=1, cost=0.0015, t_plus_1=True) -> dict:
-    """Realistic daily top/bottom quantile long-short backtest.
+                        horizon=1, cost=0.0015, t_plus_1=True, hold_days=1) -> dict:
+    """Top/bottom quantile long-short backtest with a holding period.
 
     Realism modelled:
-      * **T+1 / execution lag**: signals use close of day t; you can only trade
-        on the NEXT session, so weights formed at t earn returns from t+1 onward
-        (``lag=1``). This also enforces A-share T+1 (no same-day round trip).
-      * **transaction costs**: ``cost`` per unit turnover, per side, charged on
-        |w_t - w_{t-1}| each rebalance (commission + 0.05%% sell stamp + slippage;
-        0.0015 = 15bps is a reasonable all-in estimate).
-      * daily close-to-close returns, daily rebalance (no overlap double-count).
+      * **hold_days**: rebalance only every ``hold_days`` sessions and hold the
+        basket in between (buy-and-hold). Turnover — and thus cost drag — falls
+        ~``hold_days``x, which is the lever that turns a high-turnover signal net-
+        positive. hold_days=1 == daily rebalance.
+      * **T+1 / execution lag**: weights decided at close of day t start earning
+        on t+1 (``lag=1``), enforcing A-share T+1.
+      * **transaction costs**: ``cost`` per unit turnover per side, charged on the
+        rebalance (|Δweight|), booked on the execution day.
+      * daily close-to-close returns; no overlap double-counting.
 
     Returns gross AND net (after-cost) stats so the cost drag is explicit.
     """
     close = panel["close"].unstack(level=0).sort_index()
-    ret1 = close.pct_change()                      # close-to-close daily return
     pr = pred.unstack(level=0).sort_index()
+    dates = pr.index
+    names = pr.columns
+    ret1 = close.pct_change().reindex(index=dates, columns=names)
     lag = 1 if t_plus_1 else 0
 
-    dates = pr.index
-    prev_w = None
-    gross, net, longs, turns = [], [], [], []
+    # target weights: recompute on rebalance rows, hold (ffill) in between
+    Wt = pd.DataFrame(0.0, index=dates, columns=names)
+    last = pd.Series(0.0, index=names)
     for i, dt in enumerate(dates):
-        if i + lag >= len(dates):
-            break
-        w = _weights(pr.loc[dt], quantile)
-        if w.empty:
-            continue
-        # return realised on the session AFTER the signal (t+1): T+1 execution
-        r_dt = dates[i + lag]
-        r = ret1.loc[r_dt].reindex(w.index).fillna(0.0)
-        g = float((w * r).sum())
-        lg = float((w.clip(lower=0) * r).sum()) * 2      # long leg scaled to gross 1
-        # turnover vs previous rebalance
-        aligned = w.reindex(w.index.union(prev_w.index)).fillna(0.0) if prev_w is not None else w
-        base = prev_w.reindex(aligned.index).fillna(0.0) if prev_w is not None else aligned * 0
-        turn = float((aligned - base).abs().sum())
-        gross.append((r_dt, g))
-        net.append((r_dt, g - turn * cost))
-        longs.append((r_dt, lg))
-        turns.append(turn)
-        prev_w = w
+        if i % max(1, hold_days) == 0:
+            w = _weights(pr.loc[dt], quantile)
+            if not w.empty:
+                last = w.reindex(names).fillna(0.0)
+        Wt.loc[dt] = last
 
-    if not net:
+    W_eff = Wt.shift(lag).fillna(0.0)                 # book earning today's return
+    port = (W_eff * ret1).sum(axis=1)                 # gross daily return
+    long_leg = (W_eff.clip(lower=0) * ret1).sum(axis=1) * 2
+    turnover = (Wt - Wt.shift(1)).abs().sum(axis=1)   # target change at rebalances
+    cost_daily = turnover.shift(lag).fillna(0.0) * cost
+    net = port - cost_daily
+
+    # drop warm-up rows with no position
+    active = W_eff.abs().sum(axis=1) > 0
+    g_s, n_s, l_s = port[active], net[active], long_leg[active]
+    if g_s.empty:
         return {}
-    to_s = lambda lst: pd.Series(dict(lst)).sort_index()
-    g_s, n_s, l_s = to_s(gross), to_s(net), to_s(longs)
 
     def _stats(r):
         ann = r.mean() * 252
@@ -185,8 +183,10 @@ def backtest_long_short(pred: pd.Series, panel: pd.DataFrame, quantile=0.2,
         return dict(ann_return=float(ann), ir=float(ann / vol) if vol else np.nan,
                     maxdd=float(dd), hit=float((r > 0).mean()))
 
+    reb_days = int((turnover[active] > 1e-9).sum())
     return {"long_short_gross": _stats(g_s), "long_short_net": _stats(n_s),
             "long_only_net": _stats(l_s),
-            "avg_turnover": float(np.mean(turns)),
-            "cost_drag_annual": float((g_s.mean() - n_s.mean()) * 252),
-            "n_days": int(len(n_s)), "cost_bps": cost * 1e4, "t_plus_1": t_plus_1}
+            "avg_turnover": float(turnover[active].mean()),
+            "cost_drag_annual": float(cost_daily[active].mean() * 252),
+            "n_days": int(len(n_s)), "cost_bps": cost * 1e4,
+            "t_plus_1": t_plus_1, "hold_days": hold_days, "rebalances": reb_days}

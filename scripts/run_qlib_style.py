@@ -58,6 +58,8 @@ def main() -> None:
     ap.add_argument("--horizon", type=int, default=5, help="label = h-day fwd return")
     ap.add_argument("--quantile", type=float, default=0.2)
     ap.add_argument("--cost", type=float, default=0.0015, help="per-side turnover cost")
+    ap.add_argument("--hold-days", type=int, default=1, dest="hold_days",
+                    help="rebalance every N sessions (holding period); cuts turnover ~Nx")
     ap.add_argument("--no-norm", action="store_true")
     ap.add_argument("--refresh", action="store_true", help="ignore cached panel")
     args = ap.parse_args()
@@ -89,7 +91,8 @@ def main() -> None:
     print("Training LightGBM (Qlib Alpha158 params), evaluating IC/ICIR ...")
     res = fit_predict(X, y, normalize=not args.no_norm)
     bt = backtest_long_short(res.pred, panel, quantile=args.quantile,
-                             horizon=args.horizon, cost=args.cost, t_plus_1=True)
+                             horizon=args.horizon, cost=args.cost, t_plus_1=True,
+                             hold_days=args.hold_days)
 
     m = res.metrics
     print("\n" + "=" * 66)
@@ -103,8 +106,8 @@ def main() -> None:
     if bt:
         g, n, lo = bt["long_short_gross"], bt["long_short_net"], bt["long_only_net"]
         print("  " + "-" * 62)
-        print(f"  Backtest: T+1 execution lag, {bt['cost_bps']:.0f}bps/side cost, "
-              f"avg turnover {bt['avg_turnover']:.2f}/day")
+        print(f"  Backtest: T+1 lag, {bt['cost_bps']:.0f}bps/side, hold {bt['hold_days']}d "
+              f"({bt['rebalances']} rebalances), avg turnover {bt['avg_turnover']:.2f}/day")
         print(f"  Long-Short GROSS (top/bot {args.quantile:.0%}): "
               f"ann {g['ann_return']:+.1%}  IR {g['ir']:.2f}  MaxDD {g['maxdd']:.1%}")
         print(f"  Long-Short NET   (after costs):   "
